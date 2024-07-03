@@ -390,4 +390,183 @@ if self.mode == "matrix_slow":
             sig = jnp.fft.irfft(ftr, n=self.nn)
             sig = sig[:, :, :self.Ls]
             return sig
-        
+        elif self.mode in ["oct", "oct_complete"]:
+            sl = slice(1, len(self.g) // 2) if self.mode == "oct" else slice(0, len(self.g) // 2 + 1)
+
+            if self.mode == "oct":
+                self.gdiis, self.idx_dec = get_ragged_gdiis_oct_jax(self.gd[sl], self.M[sl], self.wins[sl], self.mode, dtype=self.dtype)
+            else: # "oct_complete"
+                self.gdiis, self.idx_dec = get_ragged_gdiis_oct_jax(self.gd[sl], self.M[sl], self.wins[sl], self.mode, dtype=self.dtype)
+
+            fr = jnp.zeros(*cseq_shape[:2], self.nn // 2 + 1, dtype=cseq_dtype)
+
+            def oct_loop_body(carry, i):
+                fr, fc = carry
+                gdii_j = self.gdiis[i]
+                idx_dec_j = self.idx_dec[i]
+
+                Lg_outer = fc.shape[-1]
+                nb_fbins = fc.shape[2]
+                temp0 = jnp.zeros(*cseq_shape[:2], nb_fbins, Lg_outer, dtype=cseq_dtype)
+                temp0 = fc * gdii_j.unsqueeze(0).unsqueeze(0)
+                fr += jnp.sum(jnp.take_along_axis(temp0, idx_dec_j.unsqueeze(0).unsqueeze(0), axis=3), axis=2)
+                return (fr, fc), None
+
+            # Assuming cseq is already split into octaves for "oct" and "oct_complete" modes
+            init_carry = (fr, cseq) 
+            (fr, _), _ = jax.lax.scan(oct_loop_body, init_carry, jnp.arange(len(self.gdiis)))
+
+            ftr = fr
+            sig = jnp.fft.irfft(ftr, n=self.nn)
+            sig = sig[:, :, :self.Ls]
+            return sig
+            def get_ragged_gdiis_oct_jax(gd, ms, wins, mode, dtype=jnp.float32):
+    seq_gdiis = []
+    ragged_gdiis = []
+    mprev = -1
+    ix = []
+
+    if mode == "oct_complete":
+        ix.append(jnp.full((1, len(gd[0]) // 2 + 1), ms[0] // 2, dtype=int))
+
+    size_per_oct = [next_power_of_2(jnp.max(ms[i * len(gd[0]):(i + 1) * len(gd[0])])) for i in range(len(ms) // len(gd[0]))]
+    ix.extend([jnp.full((len(gd[0]), len(gd[0]) // 2 + 1), size // 2, dtype=int) for size in size_per_oct])
+
+    if mode == "oct_complete":
+        ix.append(jnp.full((1, len(gd[0]) // 2 + 1), ms[-1] // 2, dtype=int))
+
+    j = 0
+    k = 0
+    for i, (g, m, win_range) in enumerate(zip(gd, ms, wins)):
+        if i > 0 and (m != mprev or (mode == "oct_complete" and i == len(gd) - 1)):
+            gdii = jnp.conj(jnp.concatenate(ragged_gdiis, axis=0)).astype(dtype)
+            seq_gdiis.append(gdii)
+            ragged_gdiis = []
+            j += 1
+            k = 0
+
+        Lg = len(g)
+        gl = g[:(Lg + 1) // 2]
+        gr = g[(Lg + 1) // 2:]
+        zeros = jnp.zeros(m - Lg, dtype=g.dtype)
+        paddedg = jnp.concatenate((gl, zeros, gr), axis=0).unsqueeze(0) * m
+        ragged_gdiis.append(paddedg)
+        mprev = m
+
+        wr1 = win_range[:(Lg) // 2]
+        wr2 = win_range[-((Lg + 1) // 2):]
+
+        if mode == "oct_complete" and i == 0:
+            ix[0] = index_update(ix[0], jax.ops.index[k, wr2], jnp.arange(len(wr2)))
+        elif mode == "oct_complete" and i == len(gd) - 1:
+            ix[-1] = index_update(ix[-1], jax.ops.index[k, wr1], m - (Lg // 2) + jnp.arange(len(wr1)))
+        else:
+            ix[j] = index_update(ix[j], jax.ops.index[k, wr1], m - (Lg // 2) + jnp.arange(len(wr1)))
+            ix[j] = index_update(ix[j], jax.ops.index[k, wr2], jnp.arange(len(wr2)))
+
+        k += 1
+
+    gdii = jnp.conj(jnp.concatenate(ragged_gdiis, axis=0)).astype(dtype)
+    seq_gdiis.append(gdii)
+    return seq_gdiis, ix
+                 elif self.mode == "critical":
+            self.gdiis = get_ragged_gdiis_critical_jax(self.gd[sl], self.M[sl], dtype=self.dtype)
+
+            fr = jnp.zeros(*cseq_shape[:2], self.nn, dtype=cseq_dtype)
+            fbin_ptr = 0
+
+            def critical_loop_body(carry, gdii_j):
+                fr, fbin_ptr, fc = carry
+                Lg_outer = gdii_j.shape[-1]
+                nb_fbins = fc.shape[2]
+                temp0 = jnp.zeros(*cseq_shape[:2], nb_fbins, Lg_outer, dtype=cseq_dtype)
+
+                def inner_loop_body(carry, i):
+                    fr, temp0 = carry
+                    wr1, wr2, Lg = self.loopparams_dec[fbin_ptr + i]
+                    r = (Lg + 1) // 2
+                    l = (Lg // 2)
+                    fr = index_add(fr, jax.ops.index[:, :, wr1], temp0[:, :, i, Lg_outer - l:Lg_outer])
+                    fr = index_add(fr, jax.ops.index[:, :, wr2], temp0[:, :, i, :r])
+                    return (fr, temp0), None
+
+                temp0 = fc * gdii_j.unsqueeze(0).unsqueeze(0)
+                init_carry = (fr, temp0)
+                (fr, _), _ = jax.lax.scan(inner_loop_body, init_carry, jnp.arange(nb_fbins))
+
+                fbin_ptr += nb_fbins
+                return (fr, fbin_ptr, fc), None
+
+            init_carry = (fr, fbin_ptr, cseq)
+            (fr, _, _), _ = jax.lax.scan(critical_loop_body, init_carry, self.gdiis)
+
+            ftr = fr[:, :, :self.nn // 2 + 1]
+            sig = jnp.fft.irfft(ftr, n=self.nn)
+            sig = sig[:, :, :self.Ls]
+            return sig
+
+        else:
+            raise ValueError(f"Invalid mode: {self.mode}")
+            def get_ragged_gdiis_critical_jax(gd, ms, dtype=jnp.float32):
+    seq_gdiis = []
+    ragged_gdiis = []
+    mprev = -1
+    for i, (g, m) in enumerate(zip(gd, ms)):
+        if i > 0 and m != mprev:
+            gdii = jnp.conj(jnp.concatenate(ragged_gdiis, axis=0)).astype(dtype)
+            seq_gdiis.append(gdii)
+            ragged_gdiis = []
+
+        Lg = len(g)
+        gl = g[:(Lg + 1) // 2]
+        gr = g[(Lg + 1) // 2:]
+        zeros = jnp.zeros(m - Lg, dtype=g.dtype)
+        paddedg = jnp.concatenate((gl, zeros, gr), axis=0).unsqueeze(0) * m
+        ragged_gdiis.append(paddedg)
+        mprev = m
+
+    gdii = jnp.conj(jnp.concatenate(ragged_gdiis, axis=0)).astype(dtype)
+    seq_gdiis.append(gdii)
+    return seq_gdiis
+def get_ragged_giis_jax(g, wins, ms, mode, dtype=jnp.float32):
+    c = jnp.zeros((len(g), len(g[0]) // 2 + 1), dtype=dtype)
+    ix = []
+
+    # ... (Logic for "oct", "matrix", "matrix_pow2" modes - same as before) ...
+
+    elif mode in ["oct_complete", "matrix_complete"]:
+        # ... (Initialization of ix - same as before) ...
+
+        def scan_body(carry, i):
+            j, k, c, ix = carry
+            gii, win_range, m = g[i], wins[i], ms[i]
+
+            if i > 0:
+                if ms[i] != ms[i - 1] or ((mode == "oct_complete" or mode == "matrix_complete") and (j == 0 or i == len(g) - 1)):
+                    j += 1
+                    k = 0
+
+            gii = jnp.fft.fftshift(gii).unsqueeze(0)
+            Lg = gii.shape[1]
+
+            if (i == 0 or i == len(g) - 1) and (mode == "oct_complete" or mode == "matrix_complete"):
+                if i == 0:
+                    c = index_update(c, jax.ops.index[i, win_range[Lg // 2:]], gii[..., Lg // 2:])
+                    ix[j] = index_update(ix[j], jax.ops.index[0, :(Lg + 1) // 2], win_range[Lg // 2:])
+                    ix[j] = index_update(ix[j], jax.ops.index[0, -(Lg // 2):], jnp.flip(win_range[Lg // 2:]))
+                if i == len(g) - 1:
+                    c = index_update(c, jax.ops.index[i, win_range[:(Lg + 1) // 2]], gii[..., :(Lg + 1) // 2])
+                    ix[j] = index_update(ix[j], jax.ops.index[0, :(Lg + 1) // 2], jnp.flip(win_range[:(Lg + 1) // 2]))
+                    ix[j] = index_update(ix[j], jax.ops.index[0, -(Lg // 2):], win_range[:(Lg) // 2])
+            else:
+                c = index_update(c, jax.ops.index[i, win_range], gii)
+                ix[j] = index_update(ix[j], jax.ops.index[k, :(Lg + 1) // 2], win_range[Lg // 2:])
+                ix[j] = index_update(ix[j], jax.ops.index[k, -(Lg // 2):], win_range[:Lg // 2])
+
+            k += 1
+            return (j, k, c, ix), None
+
+        init_carry = (0, 0, c, ix)
+        (_, _, c, ix), _ = jax.lax.scan(scan_body, init_carry, jnp.arange(len(g)))
+
+    return jnp.conj(c), ix
