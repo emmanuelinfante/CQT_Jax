@@ -1,1 +1,1 @@
-from .CQT_nsgt import CQT_nsgt
+from .cqt_nsgt_jax import CQTNSGT
