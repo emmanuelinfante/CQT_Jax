@@ -47,8 +47,8 @@ class LogScale(Scale):
         return self.fmin * self.pow2n**(bnd if bnd is not None else jnp.arange(self.bnds))
 
 
-class FlexLogOctScale(Scale): # Inherits from Scale
-    def __init__(self, fs, numocts, binsoct, flex_q):
+class FlexLogOctScale(Scale):
+    def __init__(self, fs, numocts, binsoct, flex_q, beyond=0):
         """
         @param fmin: minimum frequency (Hz)
         @param fmax: maximum frequency (Hz)
