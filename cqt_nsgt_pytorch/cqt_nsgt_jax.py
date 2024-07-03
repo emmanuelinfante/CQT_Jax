@@ -353,4 +353,41 @@ if self.mode == "matrix_slow":
             fr = jnp.zeros(*cseq_shape[:2], self.nn, dtype=cseq_dtype)
             temp0 = jnp.empty(*cseq_shape[:2], self.maxLg_dec, dtype=cseq_dtype)
             (fr, _), _ = jax.lax.scan(matrix_slow_loop_body, (fr, temp0), jnp.arange(fbins))
+    def get_ragged_gdiis_jax(gd, wins, mode, ms=None, dtype=jnp.float32):
+    ragged_gdiis = []
+    maxLg_dec = max(len(gdii) for gdii in gd)
+    ix = jnp.full((len(gd), len(gd[0]) // 2 + 1), maxLg_dec // 2, dtype=int)  # Initialize with center index
+
+    for i, (g, win_range) in enumerate(zip(gd, wins)):
+        Lg = len(g)
+        gl = g[:(Lg + 1) // 2]
+        gr = g[(Lg + 1) // 2:]
+        zeros = jnp.zeros(maxLg_dec - Lg, dtype=g.dtype)
+        paddedg = jnp.concatenate((gl, zeros, gr), axis=0).unsqueeze(0) * maxLg_dec
+        ragged_gdiis.append(paddedg)
+
+        wr1 = win_range[:(Lg) // 2]
+        wr2 = win_range[-((Lg + 1) // 2):]
+
+        if mode == "matrix_complete" and i == 0:
+            ix = index_update(ix, jax.ops.index[i, wr2], jnp.arange(len(wr2)))
+        elif mode == "matrix_complete" and i == len(gd) - 1:
+            ix = index_update(ix, jax.ops.index[i, wr1], maxLg_dec - (Lg // 2) + jnp.arange(len(wr1)))
+        else:
+            ix = index_update(ix, jax.ops.index[i, wr1], maxLg_dec - (Lg // 2) + jnp.arange(len(wr1)))
+            ix = index_update(ix, jax.ops.index[i, wr2], jnp.arange(len(wr2)))
+
+    return jnp.conj(jnp.concatenate(ragged_gdiis, axis=0)).astype(dtype), ix
+        elif self.mode in ["matrix", "matrix_complete", "matrix_pow2"]:
+            sl = slice(1, len(self.g) // 2) if self.mode in ["matrix", "matrix_pow2"] else slice(0, len(self.g) // 2 + 1)
+            self.gdiis, self.idx_dec = get_ragged_gdiis_jax(self.gd[sl], self.wins[sl], self.mode, ms=self.M[sl], dtype=self.dtype)
+
+            fr = jnp.zeros(*cseq_shape[:2], self.nn // 2 + 1, dtype=cseq_dtype)
+            temp0 = fc * self.gdiis.unsqueeze(0).unsqueeze(0)
+            fr = jnp.sum(jnp.take_along_axis(temp0, self.idx_dec.unsqueeze(0).unsqueeze(0), axis=3), axis=2)
+
+            ftr = fr
+            sig = jnp.fft.irfft(ftr, n=self.nn)
+            sig = sig[:, :, :self.Ls]
+            return sig
         
